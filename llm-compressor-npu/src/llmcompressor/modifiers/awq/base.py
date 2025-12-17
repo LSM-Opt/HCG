@@ -1,7 +1,10 @@
 import inspect
+import os
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+from torch.fx import Graph, GraphModule
+from transformers.utils.fx import HFTracer
 from compressed_tensors.quantization import disable_quantization
 from compressed_tensors.utils import (
     align_modules,
@@ -28,6 +31,7 @@ from llmcompressor.pipelines.cache import IntermediatesCache
 from llmcompressor.utils.fsdp.helpers import get_fsdp_parent
 from llmcompressor.utils.helpers import calibration_forward_context
 from llmcompressor.utils.pytorch.module import get_layer_by_name
+from llmcompressor.rbln import is_rbln_available, USE_CUSTOM_OPS, ENFORCE_EAGER
 
 __all__ = ["AWQModifier"]
 
@@ -138,6 +142,10 @@ class AWQModifier(Modifier, QuantizationMixin):
     _smooth_activation_means: Dict[str, Tuple[torch.FloatTensor, int]] = PrivateAttr(
         default_factory=dict
     )
+    # For ENFORCE_EAGER=False: capture inputs to balance layers
+    _captured_inputs: Dict[Module, torch.Tensor] = PrivateAttr(default_factory=dict)
+    _target_modules: List[str] = PrivateAttr(default_factory=list)
+    _compiled_modules: Dict[Module, Module] = PrivateAttr(default_factory=dict)
 
     # NOTE: different name chosen to avoid collision with
     # QuantizationMixin.validate_model_after, which must be called first
@@ -258,6 +266,9 @@ class AWQModifier(Modifier, QuantizationMixin):
             if not self.ended_:
                 self.on_end(state, None)
 
+        elif event.type_ == EventType.SUBGRAPH_FORWARD_END:
+            self.calibrate_subgraph()
+
     def on_end(self, state: State, event: Event, **kwargs):
         """
         Finish calibrating by setting scales and zero-points,
@@ -287,10 +298,11 @@ class AWQModifier(Modifier, QuantizationMixin):
         """
         if not self.ended_:
             self.on_end(state, None)
-
         self._parent_args_cache.clear()
         self._smooth_activation_means.clear()
         self._resolved_mappings.clear()
+        self._captured_inputs.clear()
+        self._target_modules.clear()
 
         return True
 
@@ -401,11 +413,25 @@ class AWQModifier(Modifier, QuantizationMixin):
             ):
                 self._smooth_activation_means[smooth_name] = _accumulate_mean(
                     # Assume that first argument is the input
-                    args[0].cpu().abs().detach().squeeze(),
+                    args[0].abs().detach().squeeze() if is_rbln_available() else args[0].cpu().abs().detach().squeeze(),
                     self._smooth_activation_means.get(smooth_name, None),
                 )
 
             return cache_smooth_activations_hook
+        def capture_input_hook_fn(smooth_name):
+            def capture_input_hook(
+                module: torch.nn.Module,
+                args: Tuple[torch.Tensor, ...],
+            ) -> None:
+                """
+                Hook to capture inputs to target modules for later lazy activation accumulation
+                """
+                inp = args[0]
+                if smooth_name not in self._captured_inputs:
+                    self._captured_inputs[smooth_name] = inp
+                else:
+                    self._captured_inputs[smooth_name] = torch.cat([self._captured_inputs[smooth_name], inp], dim=0)
+            return capture_input_hook
 
         for mapping in self._resolved_mappings:
             # parent kwargs needed for future forward passes
@@ -425,11 +451,51 @@ class AWQModifier(Modifier, QuantizationMixin):
             # input activations to balance layers needed for loss function
             # storing inputs to first balance layer is sufficient
             # other balance layers get the same input
-            self.register_hook(
-                mapping.balance_layers[0],
-                create_cache_smooth_activations_hook_fn(mapping.smooth_name),
-                "forward",
+            if ENFORCE_EAGER:
+                self.register_hook(
+                    mapping.balance_layers[0],
+                    create_cache_smooth_activations_hook_fn(mapping.smooth_name),
+                    "forward",
+                )
+            else:
+                self._target_modules.append(mapping.smooth_name)
+                self.register_hook(
+                    mapping.balance_layers[0],
+                    capture_input_hook_fn(mapping.smooth_name),
+                    "forward_pre",
+                )
+
+    def calibrate_subgraph(self):
+        """
+        Calibration hook to accumulate activations of target modules
+        of a subgraph. Processes all captured inputs at once after subgraph forward.
+        """
+
+        if not self._captured_inputs:
+            return
+        for key in self._target_modules:
+
+            if key not in self._captured_inputs:
+                continue
+
+            if (module_input := self._captured_inputs[key]) is None:
+                continue
+
+            # Find the corresponding smooth_name for this module
+            smooth_name = None
+            for mapping in self._resolved_mappings:
+                if mapping.smooth_name == key:
+                    smooth_name = mapping.smooth_name
+                    break
+    
+            if smooth_name is None:
+                continue
+            self._smooth_activation_means[smooth_name] = _accumulate_mean(
+                module_input.detach().clone().mean(dim=0),
+                self._smooth_activation_means.get(smooth_name, None),
             )
+
+        self._captured_inputs.clear()
 
     @torch.no_grad()
     def _apply_smoothing(self, model: Module) -> None:
@@ -451,7 +517,18 @@ class AWQModifier(Modifier, QuantizationMixin):
             smooth_layer = mapping.smooth_layer
             balance_layers = mapping.balance_layers
             parent_module = mapping.parent
-
+            if not ENFORCE_EAGER:
+                for m in parent_module.modules():
+                    # Remove unnecessary forward_pre_hooks
+                    if hasattr(m, "_forward_pre_hooks") and isinstance(m._forward_pre_hooks, dict):
+                        m._forward_pre_hooks.clear()
+                compiled_module = torch.compile(
+                    parent_module,
+                    backend="rbln",
+                    dynamic=False,
+                    options={'cache_dir': './.cache'}
+                )
+                self._compiled_modules[mapping.parent] = compiled_module
             with align_modules(
                 [parent_module, smooth_layer, *balance_layers]
             ), calibration_forward_context(model), HooksMixin.disable_hooks():
@@ -460,7 +537,8 @@ class AWQModifier(Modifier, QuantizationMixin):
                 weight = torch.cat([bl.weight for bl in balance_layers], dim=0)
                 org_shape = weight.shape
                 # The weights are reshaped to be organised by quantization group
-                weight = weight.view(-1, self._group_size)
+                if self._group_size is not None:
+                    weight = weight.view(-1, self._group_size)
                 # Calculates the relative magnitude of the weights within
                 # each of the quantization groups, and rescales each group
                 # individually so that each group has weights on a 0-1 scale.
@@ -507,7 +585,7 @@ class AWQModifier(Modifier, QuantizationMixin):
 
                 @torch.no_grad()
                 def _smooth(module):
-                    scales = best_scales.to(module.weight.device)
+                    scales = best_scales if is_rbln_available() else best_scales.to(module.weight.device)
                     if module in balance_layers:
                         update_offload_parameter(
                             module,
@@ -549,15 +627,22 @@ class AWQModifier(Modifier, QuantizationMixin):
 
                 # remove caches needed to smooth this mapping
                 del self._smooth_activation_means[mapping.smooth_name]
-
         for v in self._parent_args_cache.values():
             v.batch_intermediates.clear()
         self._assert_all_activations_consumed()
 
     def _run_samples(self, module: Module) -> List[torch.Tensor]:
-        outputs = [
-            module(**batch_kwargs) for batch_kwargs in self._parent_args_cache[module]
-        ]
+        if module in self._compiled_modules:
+            outputs = [
+                self._compiled_modules[module](**batch_kwargs)
+                for batch_kwargs in self._parent_args_cache[module]
+            ]
+        else:
+            with align_modules([module]):
+                outputs = [
+                    module(**batch_kwargs)
+                    for batch_kwargs in self._parent_args_cache[module]
+                ]
         return [
             # If Tuple, assume that first argument is the input
             output[0] if isinstance(output, Tuple) else output
@@ -587,15 +672,14 @@ class AWQModifier(Modifier, QuantizationMixin):
         best_scales = None
         best_error = float("inf")
 
-        org_sd = {
-            k: v.cpu()
-            for k, v in parent_module.state_dict().items()
-            if v.device != torch.device("meta")
-        }
+        org_sd = {k: v if is_rbln_available() else v.cpu() for k, v in parent_module.state_dict().items()}
 
-        device = get_execution_device(parent_module)
-        x_mean = x_mean.view(-1).to(device)
-        w_mean = w_mean.view(-1).to(device)
+        x_mean = x_mean.view(-1)
+        w_mean = w_mean.view(-1)
+
+        if not is_rbln_available():
+            device = get_execution_device(parent_module)
+            x_mean, w_mean = x_mean.to(device), w_mean.to(device)
 
         for ratio in range(n_grid):
             # create new scales
@@ -609,7 +693,9 @@ class AWQModifier(Modifier, QuantizationMixin):
             else:
                 scales = x_mean.pow(ratio).clamp(min=1e-4).view(-1)
             scales = scales / (scales.max() * scales.min()).sqrt()
-            _scalesview = scales.view(1, -1).to(device)
+            _scalesview = scales.view(1, -1)
+            if not is_rbln_available():
+                _scalesview = _scalesview.to(device)
 
             # avoid scaling values that overflow
             scales[torch.isinf(scales)] = 1
@@ -625,7 +711,7 @@ class AWQModifier(Modifier, QuantizationMixin):
                         w=linear.weight.data,
                         symmetric=self._symmetric,
                         bit_width=self._num_bits,
-                        group_size=self._group_size,
+                        group_size=self._group_size if self._group_size is not None else -1,
                     )[0]
                     / _scalesview,
                 )
@@ -634,7 +720,7 @@ class AWQModifier(Modifier, QuantizationMixin):
             int_w_outputs = self._run_samples(parent_module)
 
             # compute mean squared error (L2 norm)
-            loss = self._compute_loss(fp16_outputs, int_w_outputs, device)
+            loss = self._compute_loss(fp16_outputs, int_w_outputs, device=device if not is_rbln_available() else None)
 
             history.append(loss)
             if loss < best_error:
@@ -657,7 +743,7 @@ class AWQModifier(Modifier, QuantizationMixin):
             torch.isnan(best_scales).sum() == 0
         ), f"Nan found in scales: {best_scales}"
 
-        return best_scales.detach().cpu()
+        return best_scales.detach() if is_rbln_available() else best_scales.detach().cpu()
 
     @torch.no_grad()
     def _compute_loss(
@@ -671,14 +757,23 @@ class AWQModifier(Modifier, QuantizationMixin):
 
         # Compute the MSE loss for each batch
         for fp16_batch, int_w_batch in zip(fp16_outputs, int_w_outputs):
-            batch_loss = (
-                (fp16_batch.to(device) - int_w_batch.to(device))
-                .view(-1)
-                .float()
-                .pow(2)
-                .sum()
-                .item()
-            )
+            if is_rbln_available():
+                batch_loss = (
+                    (fp16_batch - int_w_batch)
+                    .view(-1)
+                    .pow(2)
+                    .sum()
+                    .item()
+                )
+            else:
+                batch_loss = (
+                    (fp16_batch.to(device) - int_w_batch.to(device))
+                    .view(-1)
+                    .float()
+                    .pow(2)
+                    .sum()
+                    .item()
+                )
             loss += batch_loss
             num_elements += fp16_batch.numel()
 
@@ -743,7 +838,7 @@ def _accumulate_mean(
     inp: torch.Tensor,
     prev_mean_and_count: Optional[Tuple[torch.FloatTensor, int]],
 ) -> Tuple[torch.FloatTensor, int]:
-    sum_added = inp.sum(dim=0)
+    sum_added = inp.sum(dim=0) if not is_rbln_available() else inp.float().sum(dim=0)
     num_added = inp.size(0)
     if prev_mean_and_count is None:
         return sum_added, num_added
