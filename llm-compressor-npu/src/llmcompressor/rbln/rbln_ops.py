@@ -218,7 +218,7 @@ def torch_cholesky_inverse(x: torch.Tensor, upper: bool = False):
             for j in range(i):
                 sum_term = torch.sum(x[i, j:i] * L_inv[j:i, j])
                 L_inv[i, j] = -sum_term / x[i, i]
-        return L_inv.T @ L_invß
+        return L_inv.T @ L_inv
 
 
 def _gram_cols(B: torch.Tensor, row_chunk: int = 64) -> torch.Tensor:

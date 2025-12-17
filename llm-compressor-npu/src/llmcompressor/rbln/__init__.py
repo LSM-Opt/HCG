@@ -13,7 +13,7 @@ if is_rbln_available():
     from .rbln_envs import ENFORCE_EAGER, USE_CUSTOM_OPS
     from .rbln_subgraph import RBLNSubgraph
     from .rbln_ops import *
-    from .rbln_subgraph import RBLNSubgraph
+    from .patch_compressed_tensors import *
 else:
     ENFORCE_EAGER = True
     USE_CUSTOM_OPS = False
