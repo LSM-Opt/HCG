@@ -11,6 +11,7 @@ def is_rbln_available():
 
 if is_rbln_available():
     from .rbln_envs import ENFORCE_EAGER, USE_CUSTOM_OPS
+    from .rbln_subgraph import RBLNSubgraph
     from .rbln_ops import *
 else:
     ENFORCE_EAGER = True
