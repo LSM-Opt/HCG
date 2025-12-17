@@ -1,4 +1,5 @@
 import contextlib
+import os
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -28,6 +29,7 @@ from llmcompressor.modifiers.quantization.gptq.gptq_quantize import (
 from llmcompressor.modifiers.quantization.quantization import QuantizationMixin
 from llmcompressor.sentinel import Sentinel
 from llmcompressor.utils.metric_logging import CompressionLogger
+from llmcompressor.rbln import is_rbln_available, ENFORCE_EAGER
 
 __all__ = ["GPTQModifier"]
 
@@ -118,6 +120,8 @@ class GPTQModifier(Modifier, QuantizationMixin):
     _module_names: Dict[torch.nn.Module, str] = PrivateAttr(default_factory=dict)
     _hessians: Dict[torch.nn.Module, torch.Tensor] = PrivateAttr(default_factory=dict)
     _num_samples: Dict[torch.nn.Module, int] = PrivateAttr(default_factory=dict)
+    _captured_inputs: Dict[torch.nn.Module, torch.Tensor] = PrivateAttr(default_factory=dict)
+    _target_modules: List[torch.nn.Module] = PrivateAttr(default_factory=list)
 
     def resolve_quantization_config(self) -> QuantizationConfig:
         config = super().resolve_quantization_config()
@@ -165,6 +169,9 @@ class GPTQModifier(Modifier, QuantizationMixin):
             for name, m in match_named_modules(state.model, self.targets, self.ignore)
         }
 
+        if is_rbln_available and os.getenv("DEVICE", "rbln").lower() == "rbln" and not self.offload_hessians:
+            raise ValueError("Set `offload_hessians` to `true` in the recipe to use GPTQ on Atom.")
+
         return True
 
     def on_start(self, state: State, event: Event, **kwargs):
@@ -182,7 +189,11 @@ class GPTQModifier(Modifier, QuantizationMixin):
                 # accessible by the layer compressor. For now, we manually ignore it,
                 # but in the FUTURE this should be ignored by the user
                 if not isinstance(module, torch.nn.Embedding):
-                    self.register_hook(module, self.calibrate_module, "forward")
+                    if ENFORCE_EAGER:
+                        self.register_hook(module, self.calibrate_module, "forward")
+                    else:
+                        self._target_modules.append(module)
+                        self.register_hook(module, self._capture_input_hook, "forward_pre")
                     added_hook = True
 
         if not added_hook:
@@ -204,6 +215,24 @@ class GPTQModifier(Modifier, QuantizationMixin):
 
             if not self.ended_:
                 self.on_end(state, None)
+
+        if event.type_ == EventType.SUBGRAPH_FORWARD_END:
+            self.calibrate_subgraph()
+
+    def _capture_input_hook(
+        self,
+        module: torch.nn.Module,
+        args: Tuple[torch.Tensor, ...],
+    ) -> None:
+        """
+        Hook to capture inputs to target modules for later lazy hessian accumulation
+
+        :param module: module whose input is being captured
+        :param args: inputs to the module, the first element of which is the
+            canonical input
+        """
+        inp = args[0]
+        self._captured_inputs.update({module: inp})
 
     def calibrate_module(
         self,
@@ -231,13 +260,51 @@ class GPTQModifier(Modifier, QuantizationMixin):
             self._num_samples[module] = 0
 
         # Accumulate hessian with input with optional offloading
-        with self._maybe_onload_hessian(module):
+        with align_module_device(
+                module, execution_device=torch.device("cpu") if is_rbln_available() else None
+            ), self._maybe_onload_hessian(module):
             self._hessians[module], self._num_samples[module] = accumulate_hessian(
                 inp,
                 module,
                 self._hessians[module],
                 self._num_samples[module],
             )
+
+    def calibrate_subgraph(self):
+        """
+        Calibration hook to accumulate the hessian of the input of target modules
+        of a subgraph. Processes all captured inputs at once after subgraph forward.
+
+        :param model: the model being calibrated
+        """
+        if not self._captured_inputs:
+            return
+
+        for module in self._target_modules:
+            if module not in self._captured_inputs:
+                continue
+
+            if (module_input := self._captured_inputs[module]) is None:
+                continue
+
+            if module not in self._num_samples:
+                init_device = (
+                    "cpu" if self.offload_hessians else get_execution_device(module)
+                )
+                self._hessians[module] = make_empty_hessian(module, device=init_device)
+                self._num_samples[module] = 0
+
+            with align_module_device(
+                    module, execution_device=torch.device("cpu") if is_rbln_available() else None
+                ), self._maybe_onload_hessian(module):
+                self._hessians[module], self._num_samples[module] = accumulate_hessian(
+                    module_input.detach().clone(),
+                    module,
+                    self._hessians[module],
+                    self._num_samples[module],
+                )
+
+        self._captured_inputs.clear()
 
     def compress_modules(self):
         """
@@ -250,7 +317,7 @@ class GPTQModifier(Modifier, QuantizationMixin):
 
             logger.info(f"Quantizing {name} using {num_samples} samples")
             with torch.no_grad(), align_module_device(
-                module
+                module, execution_device=torch.device("cpu") if is_rbln_available() else None
             ), self._maybe_onload_hessian(module), CompressionLogger(
                 module
             ) as comp_logger:
@@ -294,6 +361,8 @@ class GPTQModifier(Modifier, QuantizationMixin):
 
         self._hessians = dict()
         self._num_samples = dict()
+        self._captured_inputs = dict()
+        self._target_modules = []
 
         return True
 

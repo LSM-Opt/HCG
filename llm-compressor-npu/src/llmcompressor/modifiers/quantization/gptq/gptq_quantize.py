@@ -1,5 +1,6 @@
 import math
 from copy import copy
+import os
 from typing import Dict, Optional, Tuple, Union
 
 import torch
@@ -16,6 +17,7 @@ from llmcompressor.modifiers.utils import SPARSITY_THRESHOLD
 from llmcompressor.observers.base import Observer
 from llmcompressor.pytorch.utils.helpers import tensor_sparsity
 
+# GPTQ_PRECISION = torch.float16 if hasattr(torch, "rbln") and os.environ.get("OFFLOAD_COMPRESSION", "0") == "0" else torch.float32
 GPTQ_PRECISION = torch.float32
 
 __all__ = ["make_empty_hessian", "accumulate_hessian", "quantize_weight"]
@@ -36,7 +38,7 @@ def accumulate_hessian(
     H: Optional[torch.Tensor],
     num_samples: int,
 ) -> Tuple[torch.Tensor, int]:
-    inp = inp.to(device=H.device)
+    inp = inp.to(device=H.device, dtype=GPTQ_PRECISION)
     if len(inp.shape) == 2:
         inp = inp.unsqueeze(0)
 

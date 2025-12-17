@@ -157,3 +157,65 @@ def torch_round(x: torch.Tensor, *, decimals: int = 0, out: torch.Tensor | None 
         return out
     
     return result
+
+def torch_cholesky(x: torch.Tensor, upper: bool = False):
+    """
+    Custom implementation of Cholesky decomposition using the Cholesky-Banachiewicz algorithm.
+    
+    Args:
+        x: Symmetric positive definite matrix
+        upper: If True, return upper triangular matrix U such that A = U.T @ U
+               If False, return lower triangular matrix L such that A = L @ L.T
+    
+    Returns:
+        Cholesky factor (lower or upper triangular matrix)
+    """
+    n = x.size(0)
+    A = x.clone()
+    if upper:
+        for i in range(n):
+            A[i, i] = torch.pow(A[i, i] - torch.sum(A[:i, i] ** 2), 0.5)
+            for j in range(i + 1, n):
+                A[i, j] = (A[i, j] - torch.sum(A[:i, i] * A[:i, j])) / A[i, i]
+        U = torch.triu(A)
+        return U
+    else:
+        for i in range(n):
+            A[i, i] = torch.pow(A[i, i] - torch.sum(A[i, :i] ** 2), 0.5)
+            for j in range(i + 1, n):
+                A[j, i] = (A[j, i] - torch.sum(A[j, :i] * A[i, :i])) / A[i, i]
+        L = torch.tril(A)
+        return L
+
+
+def torch_cholesky_inverse(x: torch.Tensor, upper: bool = False):
+    """
+    Custom implementation of Cholesky inverse.
+    
+    Given a Cholesky factor L (or U), computes the inverse of the original matrix A
+    where A = L @ L.T (or A = U.T @ U for upper triangular).
+    
+    Args:
+        x: Cholesky factor (lower or upper triangular matrix)
+        upper: If True, x is upper triangular (U), if False, x is lower triangular (L)
+    
+    Returns:
+        Inverse of the original matrix A
+    """
+    n = x.size(0)
+    if upper:
+        U_inv = torch.zeros_like(x)
+        for i in range(n - 1, -1, -1):
+            U_inv[i, i] = torch.tensor(1.0, device=x.device, dtype=x.dtype) / x[i, i]
+            for j in range(i + 1, n):
+                sum_term = torch.sum(x[i, i + 1:j + 1] * U_inv[i + 1:j + 1, j])
+                U_inv[i, j] = -sum_term / x[i, i]
+        return U_inv @ U_inv.T
+    else:
+        L_inv = torch.zeros_like(x)
+        for i in range(n):
+            L_inv[i, i] = torch.tensor(1.0, device=x.device, dtype=x.dtype) / x[i, i]
+            for j in range(i):
+                sum_term = torch.sum(x[i, j:i] * L_inv[j:i, j])
+                L_inv[i, j] = -sum_term / x[i, i]
+        return L_inv.T @ L_invß
